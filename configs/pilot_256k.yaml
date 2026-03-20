@@ -1,0 +1,48 @@
+# Pilot scale for 256K vocab tokenizers.
+# ~470M transformer params, ~1.4B total. Single node (4x GH200).
+# head_dim=128 → n_embd=1280, n_head=10
+
+name: pilot-256k
+
+model:
+  n_layer: 16
+  n_embd: 1280
+  n_kv_head: 10
+  head_dim: 128
+  sequence_len: 2048
+  window_pattern: "SSSL"
+  ve_dim: 128              # cap VE embedding dim
+
+training:
+  target_param_data_ratio: 10.5
+  num_iterations: -1
+  total_batch_size: -1
+  device_batch_size: 16
+  warmup_steps: 40
+  warmdown_ratio: 0.65
+  final_lr_frac: 0.05
+  eval_tokens: 41943040
+  compile: true
+
+optimizer:
+  matrix_lr: 0.02
+  embedding_lr: 0.3
+  unembedding_lr: 0.008
+  scalar_lr: 0.5
+  weight_decay: 0.28
+
+data:
+  data_dir: null
+
+logging:
+  eval_every: 250
+  save_every: -1
+
+wandb:
+  enabled: true
+  project: tokenizer-lm
+  run_name: null
+
+output_dir: /capstor/scratch/cscs/${USER}/tokenizer-lm/checkpoints
+
+seed: 42
