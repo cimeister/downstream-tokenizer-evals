@@ -24,12 +24,13 @@ import torch.nn.functional as F
 import yaml
 import lm_eval
 import lm_eval.api.model
+import lm_eval.tasks
 
 from nanochat.gpt import GPT, GPTConfig
 from nanochat.checkpoint_manager import load_checkpoint, find_last_step
 from nanochat.common import print0
 
-from tokenizer_lm.tokenizer import load_tokenizer, generate_token_bytes
+from tokenizer_lm.tokenizer import load_tokenizer
 
 
 MGSM_LANGUAGES = ["en", "bn", "de", "es", "fr", "ja", "ru", "sw", "te", "th", "zh"]
@@ -108,7 +109,8 @@ class NanochatLM(lm_eval.api.model.LM):
         self.vocab_size = tokenizer.get_vocab_size()
 
     @property
-    def eot_id(self):
+    def eot_token_id(self):
+        # nanochat uses BOS as document delimiter (equivalent to GPT-2's <|endoftext|>)
         return self.tokenizer.get_bos_token_id()
 
     @property
@@ -134,7 +136,7 @@ class NanochatLM(lm_eval.api.model.LM):
         return ids
 
     def tok_decode(self, tokens, skip_special_tokens=True):
-        return self.tokenizer.decode(tokens)
+        return self.tokenizer.decode(tokens, skip_special_tokens=skip_special_tokens)
 
     def _model_call(self, inps):
         with torch.no_grad():
@@ -142,54 +144,88 @@ class NanochatLM(lm_eval.api.model.LM):
         return logits
 
     def _model_generate(self, context, max_length, stop, **kwargs):
-        # Greedy generation with text-level stop-string matching
-        ids = context
-        ctx_len = context.shape[1]
-        for _ in range(max_length - ctx_len):
-            logits = self._model_call(ids)
+        # Greedy generation with KV cache and text-level stop-string matching.
+        # Prefill: run the full context through the model to populate the cache.
+        # Then generate one token at a time, passing only the new token + cache.
+        from nanochat.engine import KVCache
+
+        B, ctx_len = context.shape
+        config = self.model.config if hasattr(self.model, 'config') else self.model._orig_mod.config
+
+        kv_cache = KVCache(
+            batch_size=B,
+            num_heads=config.n_kv_head,
+            seq_len=config.sequence_len,
+            head_dim=config.n_embd // config.n_head,
+            num_layers=config.n_layer,
+            device=self._device,
+            dtype=torch.bfloat16,
+        )
+
+        # Prefill: process full context, populate KV cache
+        with torch.no_grad():
+            logits = self.model(context, kv_cache=kv_cache)
+        next_id = logits[:, -1, :].argmax(dim=-1, keepdim=True)
+        generated = [next_id]
+
+        # Autoregressive generation with cached KV
+        for _ in range(max_length - ctx_len - 1):
+            with torch.no_grad():
+                logits = self.model(next_id, kv_cache=kv_cache)
             next_id = logits[:, -1, :].argmax(dim=-1, keepdim=True)
-            ids = torch.cat([ids, next_id], dim=1)
+            generated.append(next_id)
             if stop:
-                generated_text = self.tok_decode(ids[0, ctx_len:].tolist())
+                gen_ids = torch.cat(generated, dim=1)[0].tolist()
+                generated_text = self.tok_decode(gen_ids)
                 if any(s in generated_text for s in stop):
                     break
+
+        ids = torch.cat([context] + generated, dim=1)
         return ids
 
     def loglikelihood(self, requests, disable_tqdm=False):
-        from lm_eval.api.instance import Instance
-        from tqdm import tqdm
+        # nanochat does not support attention masks, so we process requests
+        # individually. Sort by sequence length to improve torch.compile
+        # cache hit rate (similar lengths reuse the same compiled graph).
+        indexed = []
+        for i, req in enumerate(requests):
+            ctx, cont = req.args
+            ctx_ids = self.tok_encode(ctx)
+            cont_ids = self.tok_encode(cont)
+            all_ids = (ctx_ids + cont_ids)[-self.max_length:]
+            cont_len = min(len(cont_ids), len(all_ids) - 1)
+            indexed.append((i, all_ids, cont_len))
 
-        results = []
-        for chunk_start in range(0, len(requests), self._batch_size):
-            chunk = requests[chunk_start:chunk_start + self._batch_size]
+        # Sort by sequence length for compile cache efficiency
+        indexed.sort(key=lambda x: len(x[1]))
 
-            for req in chunk:
-                ctx, cont = req.args
-                ctx_ids = self.tok_encode(ctx)
-                cont_ids = self.tok_encode(cont)
-                all_ids = (ctx_ids + cont_ids)[-self.max_length:]
-                input_tensor = torch.tensor([all_ids], dtype=torch.long, device=self._device)
+        results = [None] * len(requests)
+        for orig_idx, all_ids, cont_len in indexed:
+            if cont_len <= 0:
+                results[orig_idx] = (0.0, False)
+                continue
+            input_tensor = torch.tensor([all_ids], dtype=torch.long, device=self._device)
 
-                with torch.no_grad():
-                    logits = self.model(input_tensor)
+            with torch.no_grad():
+                logits = self.model(input_tensor)
 
-                # Get log probs for continuation tokens
-                cont_len = len(cont_ids)
-                logits_cont = logits[0, -cont_len-1:-1, :]
-                target_cont = torch.tensor(all_ids[-cont_len:], device=self._device)
-                log_probs = F.log_softmax(logits_cont, dim=-1)
-                token_log_probs = log_probs.gather(1, target_cont.unsqueeze(1)).squeeze(1)
-                total_ll = token_log_probs.sum().item()
-                is_greedy = (logits_cont.argmax(dim=-1) == target_cont).all().item()
-                results.append((total_ll, is_greedy))
+            logits_cont = logits[0, -cont_len-1:-1, :]
+            target_cont = torch.tensor(all_ids[-cont_len:], device=self._device)
+            log_probs = F.log_softmax(logits_cont, dim=-1)
+            token_log_probs = log_probs.gather(1, target_cont.unsqueeze(1)).squeeze(1)
+            total_ll = token_log_probs.sum().item()
+            is_greedy = (logits_cont.argmax(dim=-1) == target_cont).all().item()
+            results[orig_idx] = (total_ll, is_greedy)
 
         return results
 
     def loglikelihood_rolling(self, requests, disable_tqdm=False):
         results = []
+        bos_id = self.tokenizer.get_bos_token_id()
         for req in requests:
             (text,) = req.args
-            ids = self.tok_encode(text)[-self.max_length:]
+            ids = self.tokenizer.encode(text, prepend=bos_id)
+            ids = ids[-self.max_length:]
             input_tensor = torch.tensor([ids], dtype=torch.long, device=self._device)
 
             with torch.no_grad():
@@ -225,19 +261,28 @@ class NanochatLM(lm_eval.api.model.LM):
         return results
 
 
-def run_lm_eval_tasks(model, tokenizer, task_names, batch_size=8, device="cuda"):
+REPO_DIR = os.path.dirname(os.path.abspath(__file__))
+LOCAL_TASKS_DIR = os.path.join(REPO_DIR, "lm_eval_tasks")
+
+
+def run_lm_eval_tasks(model, tokenizer, task_names, batch_size=8, device="cuda", limit=None):
     """Run LM Evaluation Harness tasks using custom LM wrapper."""
     lm = NanochatLM(model, tokenizer, batch_size=batch_size, device=device)
+
+    task_manager = lm_eval.tasks.TaskManager(include_path=LOCAL_TASKS_DIR)
 
     results = lm_eval.simple_evaluate(
         model=lm,
         tasks=task_names,
+        limit=limit,
+        log_samples=True,
+        task_manager=task_manager,
         confirm_run_unsafe_code=True,
     )
     return results
 
 
-def compute_flores_perplexity(model, tokenizer, token_bytes, device="cuda", max_samples=200):
+def compute_flores_perplexity(model, tokenizer, device="cuda", max_samples=200):
     """
     Compute per-language BPB (bits-per-byte) on FLORES-200 devtest split.
 
@@ -249,30 +294,30 @@ def compute_flores_perplexity(model, tokenizer, token_bytes, device="cuda", max_
     results = {"per_language": {}, "per_family": {}}
 
     try:
-        flores = load_dataset("openlanguagedata/flores_plus", split="devtest", trust_remote_code=True)
-    except Exception:
-        try:
-            flores = load_dataset("facebook/flores", "all", split="devtest", trust_remote_code=True)
-        except Exception as e:
-            print(f"WARNING: Could not load FLORES-200: {e}")
-            return results
+        flores = load_dataset("openlanguagedata/flores_plus", split="devtest")
+    except Exception as e:
+        print(f"WARNING: Could not load FLORES-200: {e}")
+        return results
 
-    # Find language columns
-    lang_cols = [c for c in flores.column_names if c.startswith("sentence_") or
-                 (len(c) >= 7 and "_" in c and c not in ("id", "URL", "domain", "topic", "has_image", "has_hyperlink"))]
+    # flores_plus format: each row has 'text', 'iso_639_3', 'iso_15924' columns.
+    # Group sentences by language code (iso_639_3 + "_" + iso_15924).
+    lang_texts = {}
+    for row in flores:
+        lang_code = f"{row['iso_639_3']}_{row['iso_15924']}"
+        text = row.get("text", "")
+        if text and len(text.strip()) > 0:
+            lang_texts.setdefault(lang_code, []).append(text)
 
-    print(f"FLORES-200: found {len(lang_cols)} language columns")
+    print(f"FLORES-200: found {len(lang_texts)} languages")
     family_scores = {}
 
-    for col in lang_cols:
-        lang_code = col.replace("sentence_", "") if col.startswith("sentence_") else col
-        try:
-            texts = [row[col] for row in flores.select(range(min(max_samples, len(flores))))]
-            texts = [t for t in texts if t and len(t.strip()) > 0]
-            if len(texts) < 10:
-                continue
+    for lang_code, texts in sorted(lang_texts.items()):
+        texts = texts[:max_samples]
+        if len(texts) < 10:
+            continue
 
-            bpb = _compute_bpb(model, tokenizer, token_bytes, texts, device)
+        try:
+            bpb = _compute_bpb(model, tokenizer, texts, device)
             results["per_language"][lang_code] = {"bpb": bpb, "num_samples": len(texts)}
 
             for family, langs in LANGUAGE_FAMILIES.items():
@@ -288,18 +333,34 @@ def compute_flores_perplexity(model, tokenizer, token_bytes, device="cuda", max_
             "num_languages": len(bpbs),
         }
 
+    # Summary statistics across languages
+    all_bpbs = [v["bpb"] for v in results["per_language"].values()]
+    if all_bpbs:
+        import numpy as np
+        results["summary"] = {
+            "mean_bpb": float(np.mean(all_bpbs)),
+            "std_bpb": float(np.std(all_bpbs)),
+            "stderr_bpb": float(np.std(all_bpbs) / np.sqrt(len(all_bpbs))),
+            "min_bpb": float(np.min(all_bpbs)),
+            "max_bpb": float(np.max(all_bpbs)),
+            "num_languages": len(all_bpbs),
+        }
+
     return results
 
 
 @torch.no_grad()
-def _compute_bpb(model, tokenizer, token_bytes, texts, device, max_length=512):
+def _compute_bpb(model, tokenizer, texts, device, max_length=2048):
     """
     Compute bits-per-byte (BPB) on a list of text strings.
 
-    BPB = total_nats / (ln(2) * total_bytes), where each target token's
-    NLL is weighted by its byte length. Special tokens (byte length 0) are
-    excluded. This is the same metric as nanochat's evaluate_bpb and is
-    directly comparable across tokenizers.
+    BPB = total_nll / (ln(2) * total_utf8_bytes).
+
+    Byte count is computed by decoding the scored token IDs (the full
+    truncated sequence excluding BOS) back to text. This gives the exact
+    byte count corresponding to the NLL, handles truncation correctly,
+    and avoids issues with byte-level BPE tokens that don't decode
+    cleanly in isolation.
     """
     total_nats = 0.0
     total_bytes = 0
@@ -314,18 +375,104 @@ def _compute_bpb(model, tokenizer, token_bytes, texts, device, max_length=512):
         targets = torch.tensor([ids[1:]], dtype=torch.long, device=device)
 
         logits = model(input_ids)
-        # Per-token NLL (no reduction)
         nll = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), reduction="none")
+        total_nats += nll.sum().item()
 
-        # Weight by byte length of each target token; exclude special tokens
-        target_bytes = token_bytes[targets.view(-1)]  # byte length per target token
-        valid = target_bytes > 0
-        total_nats += (nll * valid.float()).sum().item()
-        total_bytes += target_bytes.sum().item()
+        # Decode scored tokens (excluding BOS) to get exact byte count
+        scored_ids = ids[1:]
+        decoded_text = tokenizer.decode(scored_ids)
+        total_bytes += len(decoded_text.encode("utf-8"))
 
     if total_bytes == 0:
         return float("inf")
     return total_nats / (math.log(2) * total_bytes)
+
+
+CODE_LANGUAGES = {
+    "python": "python",
+    "javascript": "javascript",
+    "java": "java",
+    "go": "go",
+    "rust": "rust",
+    "typescript": "typescript",
+    "cpp": "cpp",
+}
+
+# Held-out code data (threshold_1; training used threshold_0)
+CODE_DATA_BASE = "/capstor/store/cscs/swissai/infra01/datasets/swiss-ai/starcoderdata/thresholds"
+
+
+def compute_code_perplexity(model, tokenizer, device="cuda", max_samples=200):
+    """
+    Compute per-language BPB on held-out StarCoder code data.
+
+    Uses threshold_1 data (training used threshold_0) to avoid train/eval overlap.
+    Reports BPB per programming language, comparable across tokenizers.
+    """
+    import pandas as pd
+    from pathlib import Path
+
+    results = {"per_language": {}}
+
+    for lang_name, dir_name in sorted(CODE_LANGUAGES.items()):
+        lang_dir = Path(CODE_DATA_BASE) / dir_name / "threshold_1"
+        if not lang_dir.exists():
+            print(f"  Skipping {lang_name}: {lang_dir} not found")
+            continue
+
+        # Load texts from first parquet file(s) until we have max_samples
+        texts = []
+        for parquet_file in sorted(lang_dir.glob("*.parquet")):
+            try:
+                df = pd.read_parquet(parquet_file, columns=["content"])
+                for text in df["content"].dropna():
+                    text = str(text).strip()
+                    # Strip StarCoder metadata prefix (repo/filename/stars lines)
+                    if text.startswith("<reponame>"):
+                        lines = text.split("\n")
+                        # Skip metadata lines at the start
+                        start = 0
+                        for i, line in enumerate(lines):
+                            if line.startswith(("<reponame>", "<filename>", "<gh_stars>")):
+                                start = i + 1
+                            else:
+                                break
+                        text = "\n".join(lines[start:]).strip()
+                    if len(text) > 50:  # skip very short snippets
+                        texts.append(text)
+                    if len(texts) >= max_samples:
+                        break
+            except Exception as e:
+                print(f"  Warning: error reading {parquet_file}: {e}")
+                continue
+            if len(texts) >= max_samples:
+                break
+
+        if len(texts) < 10:
+            print(f"  Skipping {lang_name}: only {len(texts)} samples")
+            continue
+
+        texts = texts[:max_samples]
+        try:
+            bpb = _compute_bpb(model, tokenizer, texts, device)
+            results["per_language"][lang_name] = {"bpb": bpb, "num_samples": len(texts)}
+        except Exception as e:
+            print(f"  Skipping {lang_name}: {e}")
+
+    # Summary stats
+    if results["per_language"]:
+        import numpy as np
+        bpbs = [v["bpb"] for v in results["per_language"].values()]
+        results["summary"] = {
+            "mean_bpb": float(np.mean(bpbs)),
+            "std_bpb": float(np.std(bpbs)),
+            "stderr_bpb": float(np.std(bpbs) / np.sqrt(len(bpbs))),
+            "min_bpb": float(np.min(bpbs)),
+            "max_bpb": float(np.max(bpbs)),
+            "num_languages": len(bpbs),
+        }
+
+    return results
 
 
 def main():
@@ -335,8 +482,10 @@ def main():
     parser.add_argument("--tokenizer", type=str, required=True)
     parser.add_argument("--output", type=str, default="results.json")
     parser.add_argument("--tasks", nargs="+", default=["all"],
-                        choices=["all", "math", "code", "flores", "blimp"])
+                        choices=["all", "math", "gsm8k", "mgsm", "code", "code_bpb", "flores", "blimp"])
     parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--limit", type=int, default=None,
+                        help="Limit number of samples per task (for quick sanity checks)")
     parser.add_argument("--device", type=str, default="cuda")
     args = parser.parse_args()
 
@@ -351,7 +500,7 @@ def main():
 
     task_groups = set(args.tasks)
     if "all" in task_groups:
-        task_groups = {"math", "code", "flores", "blimp"}
+        task_groups = {"math", "code", "code_bpb", "flores", "blimp"}
 
     all_results = {
         "metadata": {
@@ -368,18 +517,28 @@ def main():
 
     # LM Eval Harness tasks
     harness_tasks = []
-    if "math" in task_groups:
+    if "math" in task_groups or "gsm8k" in task_groups:
         harness_tasks.append("gsm8k_cot")
+    if "math" in task_groups or "mgsm" in task_groups:
         harness_tasks.extend([f"mgsm_direct_{lang}" for lang in MGSM_LANGUAGES])
     if "code" in task_groups:
         harness_tasks.extend(["humaneval", "mbpp"])
     if "blimp" in task_groups:
         harness_tasks.append("blimp")
 
+    def _save_results():
+        """Save current results incrementally."""
+        from pathlib import Path
+        Path(args.output).parent.mkdir(parents=True, exist_ok=True)
+        with open(args.output, "w") as f:
+            json.dump(all_results, f, indent=2, default=str)
+        print(f"Results saved to {args.output}")
+
     if harness_tasks:
-        print(f"\nRunning LM Eval Harness: {harness_tasks}")
+        limit_msg = f" (limit={args.limit})" if args.limit else ""
+        print(f"\nRunning LM Eval Harness: {harness_tasks}{limit_msg}")
         harness_results = run_lm_eval_tasks(
-            model, tokenizer, harness_tasks, args.batch_size, args.device
+            model, tokenizer, harness_tasks, args.batch_size, args.device, args.limit
         )
         for task_name, metrics in harness_results.get("results", {}).items():
             all_results["scores"][task_name] = {
@@ -387,12 +546,29 @@ def main():
                 if k not in ("alias", "name") and not k.startswith("_")
             }
         all_results["metadata"]["n_shot"] = harness_results.get("n-shot", {})
+        if args.limit:
+            all_results["metadata"]["limit"] = args.limit
+
+        # Save per-sample logs for downstream analysis
+        if harness_results.get("samples"):
+            samples_path = args.output.replace(".json", "_samples.json")
+            with open(samples_path, "w") as f:
+                json.dump(harness_results["samples"], f, indent=2, default=str)
+            print(f"Per-sample logs saved to {samples_path}")
+
+        _save_results()  # incremental save after harness tasks
 
     if "flores" in task_groups:
         print("\nRunning FLORES-200 BPB evaluation...")
-        token_bytes = generate_token_bytes(tokenizer, device=args.device)
-        flores_results = compute_flores_perplexity(model, tokenizer, token_bytes, args.device)
+        flores_results = compute_flores_perplexity(model, tokenizer, args.device)
         all_results["scores"]["flores200"] = flores_results
+        _save_results()  # incremental save
+
+    if "code_bpb" in task_groups:
+        print("\nRunning code BPB evaluation (held-out StarCoder threshold_1)...")
+        code_results = compute_code_perplexity(model, tokenizer, args.device)
+        all_results["scores"]["code_bpb"] = code_results
+        _save_results()  # incremental save
 
     # Save
     from pathlib import Path
@@ -412,6 +588,12 @@ def main():
             print(f"  FLORES-200: {n_langs} languages, {n_fam} families")
             for family, fdata in sorted(metrics.get("per_family", {}).items()):
                 print(f"    {family}: BPB={fdata['mean_bpb']:.3f}")
+        elif task_name == "code_bpb":
+            summary = metrics.get("summary", {})
+            print(f"  Code BPB: mean={summary.get('mean_bpb', 'N/A'):.3f} "
+                  f"({summary.get('num_languages', 0)} languages)")
+            for lang, ldata in sorted(metrics.get("per_language", {}).items()):
+                print(f"    {lang}: BPB={ldata['bpb']:.3f} ({ldata['num_samples']} samples)")
         else:
             for k, v in metrics.items():
                 if isinstance(v, (int, float)) and "stderr" not in k:

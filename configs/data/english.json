@@ -1,0 +1,12 @@
+{
+  "description": "D1: English-only tokenizer training data (10 GB total)",
+  "languages": [
+    {
+      "name": "english",
+      "input": "/capstor/store/cscs/swissai/infra01/datasets/HuggingFaceFW/fineweb-edu/data",
+      "text_column": "text",
+      "max_files": 20,
+      "text_gb": 10.0
+    }
+  ]
+}

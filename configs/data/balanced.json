@@ -1,0 +1,243 @@
+{
+  "description": "D2: Balanced multilingual tokenizer training data (10 GB total). 3.5 GB English, 3.0 GB multilingual (30 languages, character-proportional), 1.5 GB math, 1.5 GB code.",
+  "languages": [
+    {
+      "name": "english",
+      "input": "/capstor/store/cscs/swissai/infra01/datasets/HuggingFaceFW/fineweb-edu/data",
+      "text_column": "text",
+      "max_files": 10,
+      "text_gb": 3.5
+    },
+    {
+      "name": "rus_Cyrl",
+      "input": "/capstor/store/cscs/swissai/infra01/datasets/swiss-ai/fineweb-2_0_1-quality_33-filterrobots/data/output/rus_Cyrl",
+      "text_column": "text",
+      "max_files": 5,
+      "text_gb": 1.0104
+    },
+    {
+      "name": "spa_Latn",
+      "input": "/capstor/store/cscs/swissai/infra01/datasets/swiss-ai/fineweb-2_0_1-quality_33-filterrobots/data/output/spa_Latn",
+      "text_column": "text",
+      "max_files": 3,
+      "text_gb": 0.2324
+    },
+    {
+      "name": "deu_Latn",
+      "input": "/capstor/store/cscs/swissai/infra01/datasets/swiss-ai/fineweb-2_0_1-quality_33-filterrobots/data/output/deu_Latn",
+      "text_column": "text",
+      "max_files": 3,
+      "text_gb": 0.2257
+    },
+    {
+      "name": "fra_Latn",
+      "input": "/capstor/store/cscs/swissai/infra01/datasets/swiss-ai/fineweb-2_0_1-quality_33-filterrobots/data/output/fra_Latn",
+      "text_column": "text",
+      "max_files": 3,
+      "text_gb": 0.1957
+    },
+    {
+      "name": "cmn_Hani",
+      "input": "/capstor/store/cscs/swissai/infra01/datasets/swiss-ai/fineweb-2_0_1-quality_33-filterrobots/data/output/cmn_Hani",
+      "text_column": "text",
+      "max_files": 3,
+      "text_gb": 0.1819
+    },
+    {
+      "name": "jpn_Jpan",
+      "input": "/capstor/store/cscs/swissai/infra01/datasets/swiss-ai/fineweb-2_0_1-quality_33-filterrobots/data/output/jpn_Jpan",
+      "text_column": "text",
+      "max_files": 3,
+      "text_gb": 0.1202
+    },
+    {
+      "name": "ita_Latn",
+      "input": "/capstor/store/cscs/swissai/infra01/datasets/swiss-ai/fineweb-2_0_1-quality_33-filterrobots/data/output/ita_Latn",
+      "text_column": "text",
+      "max_files": 3,
+      "text_gb": 0.1135
+    },
+    {
+      "name": "por_Latn",
+      "input": "/capstor/store/cscs/swissai/infra01/datasets/swiss-ai/fineweb-2_0_1-quality_33-filterrobots/data/output/por_Latn",
+      "text_column": "text",
+      "max_files": 3,
+      "text_gb": 0.1131
+    },
+    {
+      "name": "tur_Latn",
+      "input": "/capstor/store/cscs/swissai/infra01/datasets/swiss-ai/fineweb-2_0_1-quality_33-filterrobots/data/output/tur_Latn",
+      "text_column": "text",
+      "max_files": 3,
+      "text_gb": 0.0894
+    },
+    {
+      "name": "ind_Latn",
+      "input": "/capstor/store/cscs/swissai/infra01/datasets/swiss-ai/fineweb-2_0_1-quality_33-filterrobots/data/output/ind_Latn",
+      "text_column": "text",
+      "max_files": 3,
+      "text_gb": 0.0867
+    },
+    {
+      "name": "pol_Latn",
+      "input": "/capstor/store/cscs/swissai/infra01/datasets/swiss-ai/fineweb-2_0_1-quality_33-filterrobots/data/output/pol_Latn",
+      "text_column": "text",
+      "max_files": 3,
+      "text_gb": 0.0836
+    },
+    {
+      "name": "ukr_Cyrl",
+      "input": "/capstor/store/cscs/swissai/infra01/datasets/swiss-ai/fineweb-2_0_1-quality_33-filterrobots/data/output/ukr_Cyrl",
+      "text_column": "text",
+      "max_files": 2,
+      "text_gb": 0.0644
+    },
+    {
+      "name": "nld_Latn",
+      "input": "/capstor/store/cscs/swissai/infra01/datasets/swiss-ai/fineweb-2_0_1-quality_33-filterrobots/data/output/nld_Latn",
+      "text_column": "text",
+      "max_files": 2,
+      "text_gb": 0.0617
+    },
+    {
+      "name": "ron_Latn",
+      "input": "/capstor/store/cscs/swissai/infra01/datasets/swiss-ai/fineweb-2_0_1-quality_33-filterrobots/data/output/ron_Latn",
+      "text_column": "text",
+      "max_files": 2,
+      "text_gb": 0.055
+    },
+    {
+      "name": "arb_Arab",
+      "input": "/capstor/store/cscs/swissai/infra01/datasets/swiss-ai/fineweb-2_0_1-quality_33-filterrobots/data/output/arb_Arab",
+      "text_column": "text",
+      "max_files": 2,
+      "text_gb": 0.0514
+    },
+    {
+      "name": "hun_Latn",
+      "input": "/capstor/store/cscs/swissai/infra01/datasets/swiss-ai/fineweb-2_0_1-quality_33-filterrobots/data/output/hun_Latn",
+      "text_column": "text",
+      "max_files": 2,
+      "text_gb": 0.0483
+    },
+    {
+      "name": "vie_Latn",
+      "input": "/capstor/store/cscs/swissai/infra01/datasets/swiss-ai/fineweb-2_0_1-quality_33-filterrobots/data/output/vie_Latn",
+      "text_column": "text",
+      "max_files": 2,
+      "text_gb": 0.0411
+    },
+    {
+      "name": "ces_Latn",
+      "input": "/capstor/store/cscs/swissai/infra01/datasets/swiss-ai/fineweb-2_0_1-quality_33-filterrobots/data/output/ces_Latn",
+      "text_column": "text",
+      "max_files": 2,
+      "text_gb": 0.0407
+    },
+    {
+      "name": "ell_Grek",
+      "input": "/capstor/store/cscs/swissai/infra01/datasets/swiss-ai/fineweb-2_0_1-quality_33-filterrobots/data/output/ell_Grek",
+      "text_column": "text",
+      "max_files": 2,
+      "text_gb": 0.0335
+    },
+    {
+      "name": "fin_Latn",
+      "input": "/capstor/store/cscs/swissai/infra01/datasets/swiss-ai/fineweb-2_0_1-quality_33-filterrobots/data/output/fin_Latn",
+      "text_column": "text",
+      "max_files": 2,
+      "text_gb": 0.0223
+    },
+    {
+      "name": "tha_Thai",
+      "input": "/capstor/store/cscs/swissai/infra01/datasets/swiss-ai/fineweb-2_0_1-quality_33-filterrobots/data/output/tha_Thai",
+      "text_column": "text",
+      "max_files": 2,
+      "text_gb": 0.0219
+    },
+    {
+      "name": "slk_Latn",
+      "input": "/capstor/store/cscs/swissai/infra01/datasets/swiss-ai/fineweb-2_0_1-quality_33-filterrobots/data/output/slk_Latn",
+      "text_column": "text",
+      "max_files": 2,
+      "text_gb": 0.0188
+    },
+    {
+      "name": "bul_Cyrl",
+      "input": "/capstor/store/cscs/swissai/infra01/datasets/swiss-ai/fineweb-2_0_1-quality_33-filterrobots/data/output/bul_Cyrl",
+      "text_column": "text",
+      "max_files": 2,
+      "text_gb": 0.0183
+    },
+    {
+      "name": "hrv_Latn",
+      "input": "/capstor/store/cscs/swissai/infra01/datasets/swiss-ai/fineweb-2_0_1-quality_33-filterrobots/data/output/hrv_Latn",
+      "text_column": "text",
+      "max_files": 2,
+      "text_gb": 0.0161
+    },
+    {
+      "name": "kor_Hang",
+      "input": "/capstor/store/cscs/swissai/infra01/datasets/swiss-ai/fineweb-2_0_1-quality_33-filterrobots/data/output/kor_Hang",
+      "text_column": "text",
+      "max_files": 2,
+      "text_gb": 0.0156
+    },
+    {
+      "name": "cat_Latn",
+      "input": "/capstor/store/cscs/swissai/infra01/datasets/swiss-ai/fineweb-2_0_1-quality_33-filterrobots/data/output/cat_Latn",
+      "text_column": "text",
+      "max_files": 2,
+      "text_gb": 0.0098
+    },
+    {
+      "name": "hin_Deva",
+      "input": "/capstor/store/cscs/swissai/infra01/datasets/swiss-ai/fineweb-2_0_1-quality_33-filterrobots/data/output/hin_Deva",
+      "text_column": "text",
+      "max_files": 2,
+      "text_gb": 0.0094
+    },
+    {
+      "name": "heb_Hebr",
+      "input": "/capstor/store/cscs/swissai/infra01/datasets/swiss-ai/fineweb-2_0_1-quality_33-filterrobots/data/output/heb_Hebr",
+      "text_column": "text",
+      "max_files": 2,
+      "text_gb": 0.0089
+    },
+    {
+      "name": "ben_Beng",
+      "input": "/capstor/store/cscs/swissai/infra01/datasets/swiss-ai/fineweb-2_0_1-quality_33-filterrobots/data/output/ben_Beng",
+      "text_column": "text",
+      "max_files": 2,
+      "text_gb": 0.0067
+    },
+    {
+      "name": "tam_Taml",
+      "input": "/capstor/store/cscs/swissai/infra01/datasets/swiss-ai/fineweb-2_0_1-quality_33-filterrobots/data/output/tam_Taml",
+      "text_column": "text",
+      "max_files": 2,
+      "text_gb": 0.0036
+    },
+    {
+      "name": "math",
+      "input": "/capstor/store/cscs/swissai/infra01/datasets/HuggingFaceTB/finemath/finemath-4plus",
+      "text_column": "text",
+      "max_files": 5,
+      "text_gb": 1.5
+    },
+    {
+      "name": "code_python",
+      "input": "/capstor/store/cscs/swissai/infra01/datasets/swiss-ai/starcoderdata/thresholds/python/threshold_0",
+      "text_column": "content",
+      "max_files": 5,
+      "text_gb": 1.0
+    },
+    {
+      "name": "code_javascript",
+      "input": "/capstor/store/cscs/swissai/infra01/datasets/swiss-ai/starcoderdata/thresholds/javascript/threshold_0",
+      "text_column": "content",
+      "max_files": 3,
+      "text_gb": 0.5
+    }
+  ]
+}

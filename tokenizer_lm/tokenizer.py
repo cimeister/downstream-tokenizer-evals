@@ -39,6 +39,9 @@ class TokenizerWrapper(HuggingFaceTokenizer):
         super().__init__(tokenizer)
         self._bos_id = self._find_bos_token_id()
 
+    def decode(self, ids, skip_special_tokens=False):
+        return self.tokenizer.decode(ids, skip_special_tokens=skip_special_tokens)
+
     @classmethod
     def from_path(cls, tokenizer_path: str):
         """

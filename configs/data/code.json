@@ -1,0 +1,40 @@
+{
+  "description": "D3: Code-heavy tokenizer training data (10 GB total). 5 GB English web, 5 GB code (Python, JavaScript, Java, C++).",
+  "languages": [
+    {
+      "name": "english",
+      "input": "/capstor/store/cscs/swissai/infra01/datasets/HuggingFaceFW/fineweb-edu/data",
+      "text_column": "text",
+      "max_files": 10,
+      "text_gb": 5.0
+    },
+    {
+      "name": "code_python",
+      "input": "/capstor/store/cscs/swissai/infra01/datasets/swiss-ai/starcoderdata/thresholds/python/threshold_0",
+      "text_column": "content",
+      "max_files": 10,
+      "text_gb": 2.0
+    },
+    {
+      "name": "code_javascript",
+      "input": "/capstor/store/cscs/swissai/infra01/datasets/swiss-ai/starcoderdata/thresholds/javascript/threshold_0",
+      "text_column": "content",
+      "max_files": 5,
+      "text_gb": 1.0
+    },
+    {
+      "name": "code_java",
+      "input": "/capstor/store/cscs/swissai/infra01/datasets/swiss-ai/starcoderdata/thresholds/java/threshold_0",
+      "text_column": "content",
+      "max_files": 5,
+      "text_gb": 1.0
+    },
+    {
+      "name": "code_cpp",
+      "input": "/capstor/store/cscs/swissai/infra01/datasets/swiss-ai/starcoderdata/thresholds/cpp/threshold_0",
+      "text_column": "content",
+      "max_files": 5,
+      "text_gb": 1.0
+    }
+  ]
+}

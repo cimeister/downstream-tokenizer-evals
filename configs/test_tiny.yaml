@@ -29,6 +29,7 @@ optimizer:
   unembedding_lr: 0.008
   scalar_lr: 0.5
   weight_decay: 0.28
+  width_lr_exponent: -1.0
 
 data:
   data_dir: /capstor/scratch/cscs/cmeister747/data/test-tiny

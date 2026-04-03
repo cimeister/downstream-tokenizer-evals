@@ -1,0 +1,314 @@
+# Result Computation and Analysis Procedures
+
+This document describes the exact evaluation and analysis procedures used in the tokenizer-lm project. All procedures are implemented in `eval_runner.py`, `scripts/correlate_intrinsic_downstream.py`, and `scripts/generate_latex_tables.py`.
+
+---
+
+## 1. Downstream Evaluation (`eval_runner.py`)
+
+### 1.1 Bits-Per-Byte (BPB) Computation
+
+BPB is the primary cross-tokenizer-comparable metric. It normalizes language model loss by UTF-8 byte count rather than token count, eliminating dependence on tokenizer vocabulary and fertility.
+
+**Formula:**
+
+```
+BPB = Σᵢ NLLᵢ / (ln(2) × B)
+```
+
+where NLLᵢ is the per-token negative log-likelihood (in nats, from `F.cross_entropy`), and B is the total UTF-8 byte count of the scored text. The ln(2) converts nats to bits.
+
+**Byte counting procedure:**
+
+Bytes are computed by decoding the scored token IDs back to text and measuring the UTF-8 byte length:
+
+```python
+ids = tokenizer.encode(text, prepend=bos_id)
+ids = ids[:max_length]          # truncate to model context length
+# ... forward pass on ids[:-1], NLL on ids[1:] ...
+scored_ids = ids[1:]            # exclude BOS
+decoded_text = tokenizer.decode(scored_ids)
+total_bytes += len(decoded_text.encode("utf-8"))
+```
+
+Truncation happens before byte counting, so the byte count reflects exactly the tokens scored. This approach avoids issues with byte-level BPE tokens that do not decode cleanly in isolation (e.g., partial UTF-8 sequences).
+
+**BOS handling:**
+
+BOS is always prepended: `ids = tokenizer.encode(text, prepend=bos_id)`. The BOS token at position 0 serves as context for predicting the first real token. BOS is excluded from both the NLL sum (targets = ids[1:]) and the byte count (scored_ids = ids[1:]).
+
+**Truncation:**
+
+Sequences are truncated to `max_length=2048` tokens (matching the model's training context length). For FLORES sentences this rarely triggers (sentences are short). For code BPB, longer files are truncated, and BPB reflects only the scored prefix.
+
+### 1.2 FLORES-200 Evaluation
+
+**Dataset:** `openlanguagedata/flores_plus`, split `"devtest"`.
+
+**Languages:** All languages present in the dataset (~200+), dynamically detected. Languages are identified by `{iso_639_3}_{iso_15924}` codes (e.g., `eng_Latn`, `cmn_Hans`).
+
+**Sampling:** Up to 200 sentences per language (`max_samples=200`). Languages with fewer than 10 samples are skipped.
+
+**Aggregation:**
+- Per-language BPB (one value per language)
+- Per-language-family mean BPB (16 families defined in `LANGUAGE_FAMILIES`)
+- Summary statistics across all languages: mean, std, stderr, min, max, count
+
+### 1.3 Code BPB Evaluation
+
+**Data source:** StarCoderData parquet files at `/capstor/store/cscs/swissai/infra01/datasets/swiss-ai/starcoderdata/thresholds/`.
+
+**Train/eval split:** Training uses `threshold_0`. Evaluation uses `threshold_1` (held-out, disjoint from training data).
+
+**Languages:** 7 programming languages: Python, JavaScript, Java, Go, Rust, TypeScript, C++.
+
+**Preprocessing:** StarCoder metadata prefixes (`<reponame>`, `<filename>`, `<gh_stars>` lines) are stripped from each file. Snippets of 50 characters or fewer are skipped (`len(text) > 50`). Up to 200 samples per language.
+
+**Aggregation:** Same structure as FLORES — per-language BPB plus summary statistics with stderr.
+
+### 1.4 lm-eval-harness Benchmarks
+
+All benchmarks use lm-eval-harness v0.4.11 via `lm_eval.simple_evaluate()` with a custom `NanochatLM` wrapper.
+
+| Benchmark | Task name | n-shot | Metric | Generation |
+|-----------|-----------|--------|--------|------------|
+| BLiMP | `blimp` | 0-shot | accuracy (67 subtasks) | loglikelihood |
+| GSM8K | `gsm8k_cot` | 8-shot (CoT) | exact_match | generate_until |
+| MGSM | `mgsm_direct_{lang}` × 11 | 0-shot (direct) | exact_match | generate_until |
+| HumanEval | `humaneval` | 0-shot | pass@1 (greedy, k=1) | generate_until |
+| MBPP | `mbpp` | 3-shot | pass@1 (greedy, k=1) | generate_until |
+
+**MGSM dataset override:** The default lm-eval `juletxara/mgsm` dataset uses a legacy loading script incompatible with `datasets>=4.0`. Local task overrides in `lm_eval_tasks/mgsm_direct/` point to `jbross-ibm-research/mgsm` (parquet format, same data).
+
+**HumanEval/MBPP pass@1:** Uses `repeats=1` with greedy decoding (`do_sample=false`). This is deterministic but not directly comparable to papers reporting pass@1 with n=200 samples at temperature 0.8. Valid for cross-tokenizer comparison.
+
+**Per-sample logging:** All evaluations save per-sample predictions via `log_samples=True`, enabling downstream analyses (e.g., per-problem digit alignment scoring).
+
+### 1.5 KV-Cached Generation
+
+The `NanochatLM._model_generate` method uses nanochat's `KVCache` for efficient autoregressive generation:
+
+1. **Prefill phase:** The full context is processed in one forward pass, populating the KV cache for all layers.
+2. **Generation phase:** Each new token is generated by passing only the single new token plus the cached KV states.
+
+The KV cache is allocated with parameters matching the model config: `batch_size`, `num_heads=n_kv_head`, `seq_len=sequence_len`, `head_dim=n_embd//n_head`, `num_layers=n_layer`, in bfloat16. Generation is greedy (argmax). Stop strings are checked at the text level after each token.
+
+### 1.6 Result File Formats
+
+**Naming conventions:**
+
+| File pattern | Contents |
+|---|---|
+| `{prefix}-{slug}_blimp_code_bpb.json` | BLiMP + code BPB (Phase A) |
+| `{prefix}-{slug}_gsm8k.json` | GSM8K results |
+| `{prefix}-{slug}_mgsm.json` | MGSM results (11 languages) |
+| `{prefix}-{slug}_code_gen.json` | HumanEval + MBPP |
+| `{prefix}-{slug}_gen_limit{N}.json` | All gen tasks on N samples |
+| `results/flores/{prefix}-{slug}.json` | FLORES-200 BPB |
+
+Where `prefix` is `pilot-128k` or `full-128k` and `slug` is the tokenizer name (e.g., `gpt4o-balanced-bpe`).
+
+**JSON structure:**
+```json
+{
+  "metadata": {"checkpoint_dir", "step", "tokenizer_path", "val_bpb", ...},
+  "scores": {
+    "blimp": {"acc,none": 0.612, "acc_stderr,none": 0.002},
+    "code_bpb": {"per_language": {...}, "summary": {"mean_bpb", "stderr_bpb", ...}},
+    ...
+  }
+}
+```
+
+**Incremental saving:** Results are saved after each evaluation phase completes, so partial results are preserved if the process is interrupted.
+
+---
+
+## 2. Correlation Analysis (`scripts/correlate_intrinsic_downstream.py`)
+
+### 2.1 Intrinsic Metrics
+
+Intrinsic tokenizer metrics are loaded from a configurable JSON file (default: `~/tokenizer-intrinsic-evals/results/downstream_lm_flores/analysis_results.json`). The `--intrinsic-results` flag overrides this path.
+
+**Per-language metrics** (available for pooled/mixed-effects analysis):
+
+| Metric | JSON path (per tokenizer, per language) |
+|---|---|
+| `compression_rate` | `compression_rate.per_tokenizer[tok].per_language[lang]` (scalar) |
+| `fertility` | `fertility.per_tokenizer[tok].per_language[lang].mean` |
+| `unigram_entropy` | `unigram_distribution_metrics.per_tokenizer[tok].per_language[lang].unigram_entropy` |
+| `bigram_entropy` | `bigram_entropy.per_tokenizer[tok].per_language[lang].bigram_entropy` |
+| `trigram_entropy` | `trigram_entropy.per_tokenizer[tok].per_language[lang].trigram_entropy` |
+| `vocab_utilization` | `vocabulary_utilization.per_tokenizer[tok].per_language[lang].utilization` |
+| `utf8_char_split` | `utf8_char_split.per_tokenizer[tok].per_language[lang].split_rate` |
+| `renyi_2.0` | `renyi_efficiency.per_tokenizer[tok].per_language[lang].renyi_2.0` (new format) or `renyi_efficiency.per_tokenizer[tok].renyi_2.0[lang]` (old format). Global: `.global.renyi_2.0` or `.renyi_2.0.overall` |
+
+**Global-only metrics** (aggregate correlation only):
+
+| Metric | JSON path |
+|---|---|
+| `gini_coefficient` | `tokenizer_fairness_gini.per_tokenizer[tok].global.gini_coefficient` |
+| `ast_full_alignment` | `ast_boundary_alignment.per_tokenizer[tok].global.full_alignment_rate` |
+| `ident_fragmentation` | `identifier_fragmentation.per_tokenizer[tok].global.fragmentation_rate` |
+| `digit_boundary_f1` | `three_digit_boundary_alignment.per_tokenizer[tok].per_language` → first entry's `mean_f1` |
+| `operator_isolation` | `operator_isolation_rate.per_tokenizer[tok].per_language` → first entry's `isolation_rate` |
+
+Note: `digit_boundary_f1` and `operator_isolation` are computed on built-in math sample data (single "language" entry), not per-language.
+
+### 2.2 Downstream Metrics
+
+| Metric | Source file pattern | Extraction |
+|---|---|---|
+| `val_bpb` | `*_blimp_code_bpb.json` or `*_blimp.json` | `metadata.val_bpb` |
+| `flores_all_bpb` | `results/flores/*.json` | Mean across all per-language BPB values |
+| `code_bpb` | `*_blimp_code_bpb.json` or `*_codebpb.json` | `scores.code_bpb.summary.mean_bpb` |
+| `blimp_acc` | `*_blimp_code_bpb.json` or `*_blimp.json` | `scores.blimp.acc,none` |
+| `gsm8k` | `*_gsm8k.json` or `*_gen_limit{N}.json` | `scores.gsm8k_cot.exact_match,strict-match` |
+| `humaneval` | `*_code_gen.json` or `*_gen_limit{N}.json` | `scores.humaneval.pass@1,create_test` |
+| `mbpp` | `*_code_gen.json` or `*_gen_limit{N}.json` | `scores.mbpp.pass_at_1,none` |
+
+When `--gen-limit N` is specified, **only** `*_gen_limit{N}.json` files are loaded for generation metrics. This prevents mixing evaluation protocols (different sample sizes).
+
+### 2.3 Mixed-Effects Regression
+
+**Purpose:** Test whether intrinsic tokenizer metrics predict FLORES BPB within each language, while accounting for the fact that different languages have different baseline BPB.
+
+**Model:** For each intrinsic metric M:
+
+```
+BPB_scaled(T, L) ~ β × M_scaled(T, L) + (1 | L)
+```
+
+where T indexes tokenizers, L indexes languages, and `(1 | L)` is a random intercept per language.
+
+**Standardization:** Both BPB and the intrinsic metric are standardized (z-scored globally) before fitting, so β represents effect size in standard deviation units. A β of −0.05 means one SD improvement in the intrinsic metric corresponds to 0.05 SD lower BPB, holding language constant.
+
+**Estimation:** REML (Restricted Maximum Likelihood) via `statsmodels.regression.mixed_linear_model.MixedLM`.
+
+**Sample size:** n = 18 tokenizers × 31 languages = 558 observations, with 31 language groups.
+
+**FDR correction:** Benjamini-Hochberg applied across all per-language intrinsic metrics tested.
+
+**Companion statistic:** The median within-language Spearman ρ across the 31 languages is reported alongside β as a non-parametric summary.
+
+### 2.4 Aggregate Spearman Correlations
+
+**Purpose:** Test whether globally better tokenizers (by intrinsic metric) produce globally better LMs (by downstream metric).
+
+**Computation:** For each (intrinsic metric, downstream metric) pair, compute Spearman rank correlation across n=18 tokenizers. Both Spearman ρ and Pearson r are computed; Spearman is reported in tables.
+
+**FDR correction:** BH-FDR applied separately to the Spearman p-values across all (intrinsic × downstream) pairs.
+
+**Minimum sample size:** Pairs with fewer than 5 non-NA values are excluded.
+
+### 2.5 Per-Language Correlations
+
+For each language L and intrinsic metric M:
+- Compute Spearman ρ between `intrinsic(T, L)` and `FLORES_BPB(T, L)` across all tokenizers T with valid data.
+- Requires n ≥ 5 tokenizers.
+- BH-FDR correction applied across all (language × metric) tests.
+
+These per-language ρ values are used to compute the median ρ reported in the mixed-effects table.
+
+### 2.6 Controlled Pairwise Comparisons
+
+**Purpose:** Isolate the effect of specific design choices by comparing tokenizer pairs that differ in exactly one factor.
+
+**Factors tested (11 comparisons):**
+- NFC normalization (3 pairs): GPT-4o, Claude, RightAlign ± NFC
+- Algorithm (3 pairs): BPE vs UnigramLM (GPT-4o, Claude, RightAlign)
+- Pretokenizer (3 pairs): GPT-4o vs Claude, Punct, RightAlign
+- Training data (2 pairs): Balanced vs English-only, Balanced vs Code-heavy
+
+**FLORES BPB significance test:** Wilcoxon signed-rank test on the 31 per-language BPB differences (Δ = B − A). This is a paired non-parametric test appropriate for non-normal paired differences.
+
+**FDR correction:** All 11 Wilcoxon p-values are corrected jointly via BH-FDR.
+
+**Other metrics:** Val BPB, BLiMP, and Code BPB deltas are reported as raw Δ values without significance testing (single paired observation, no per-language breakdown).
+
+### 2.7 Metric Ordering
+
+In the aggregate correlation table, intrinsic metrics are ordered by their mean |ρ| across all available downstream metrics. This reflects overall predictive power rather than performance on any single benchmark.
+
+---
+
+## 3. Table Generation (`scripts/generate_latex_tables.py`)
+
+### 3.1 Table Types
+
+| Table | Contents | Flag |
+|---|---|---|
+| Tokenizer grid | Algorithm, pretokenizer, training data, NFC, source | `--table grid` |
+| Main 1B results | Val BPB, FLORES, Code BPB, BLiMP, HumanEval, MBPP, GSM8K | `--table main` |
+| Pilot 300M results | Val BPB, FLORES, Code BPB | `--table pilot` |
+| Language breakdown | 30 multilingual training languages by byte share | `--table langs` |
+
+### 3.2 Gen-Limit Handling
+
+`--gen-limit N` controls which result files are used for generation metrics (HumanEval, MBPP, GSM8K). When specified, `*_gen_limit{N}.json` files are tried first, with fallback to full evaluation files (`*_code_gen.json`, `*_gsm8k.json`). **Note:** In `correlate_intrinsic_downstream.py`, `--gen-limit` strictly restricts to gen_limit files only (no fallback), to prevent mixing evaluation protocols in correlation analysis.
+
+---
+
+## 4. Key Design Decisions
+
+### Why BPB, not perplexity
+
+Token-level perplexity (PPL = exp(NLL/num_tokens)) depends on the tokenizer's vocabulary and fertility: a tokenizer that splits text into more tokens produces lower per-token NLL but higher total NLL. BPB normalizes by bytes, making the metric independent of tokenization granularity. Two tokenizers encoding the same text will have different token counts but the same byte count.
+
+### Why mixed-effects, not pooled z-score correlation
+
+The initial approach z-scored within each language and pooled all (tokenizer, language) pairs as independent observations (n=558). However, observations within the same language are not independent — they share the same training data and FLORES evaluation sentences. This inflates the effective sample size and produces overly optimistic p-values (by orders of magnitude). The mixed-effects model accounts for this clustering via random intercepts per language, producing correct standard errors and p-values.
+
+### Why BH-FDR, not Bonferroni
+
+Bonferroni correction divides α by the number of tests, which is overly conservative when tests are correlated (as intrinsic metrics are — many are r > 0.8). BH-FDR controls the false discovery rate rather than the family-wise error rate, maintaining higher power while still limiting the expected proportion of false positives.
+
+### Why Spearman, not Pearson for aggregate correlations
+
+With n=18 tokenizers, a single outlier (e.g., an off-the-shelf tokenizer trained on vastly different data) can dominate Pearson r. Spearman rank correlation is robust to outliers and monotonic non-linearity. Both are computed; Spearman is reported in tables.
+
+### Code BPB train/eval split
+
+The LM training mixture uses StarCoderData `threshold_0` for Python and JavaScript. Code BPB evaluation uses `threshold_1` (a separate quality-filtered subset), ensuring no train/eval overlap. This is enforced by the hardcoded path constant `CODE_DATA_BASE`.
+
+### MGSM dataset override
+
+The original `juletxara/mgsm` HuggingFace dataset uses a legacy Python loading script incompatible with `datasets>=4.0`. Local task overrides in `lm_eval_tasks/mgsm_direct/` redirect to `jbross-ibm-research/mgsm`, a parquet re-upload of the same data. The data content is identical; only the loading mechanism differs.
+
+---
+
+## 5. Nanochat-Specific Quirks
+
+These are implementation details of the nanochat architecture that affect evaluation. They apply equally to all tokenizer configurations (not a confound for cross-tokenizer comparison) but must be understood for correct implementation.
+
+### No attention mask support
+
+The nanochat GPT model does not accept an attention mask parameter. Consequently, `loglikelihood` processes each request individually (batch size 1 for the forward pass). This makes BLiMP evaluation slow (~70 min for 134K requests on a 1.27B model) but ensures correctness. Requests are sorted by sequence length to improve `torch.compile` cache hit rates.
+
+### BOS as document delimiter
+
+nanochat uses the BOS token as a document delimiter (equivalent to GPT-2's `<|endoftext|>`). The `eot_token_id` property in `NanochatLM` returns the BOS token ID. Different tokenizers have different BOS tokens (`<s>` for custom tokenizers, `<|begin_of_text|>` for LLaMA-3), but all are mapped to their respective IDs via `_find_bos_token_id()`.
+
+### Logit soft-capping
+
+Logits are soft-capped via `15 · tanh(logits/15)` before the final softmax. This compresses extreme logit values and affects the magnitude of log-probabilities. The effect is consistent across tokenizers.
+
+### Sliding window attention
+
+The `SSSL` window pattern means 3 of every 4 layers attend only to the nearest ~512 tokens (quarter of context length, rounded to Flash Attention tile size). Every 4th layer attends to the full 2048-token context. This limits effective context for some layers but is consistent across tokenizers.
+
+### Value embeddings and parameter count
+
+Value embeddings at alternating layers (12 of 24) add 128K × 128 × 12 ≈ 197M parameters that scale linearly with vocabulary size. The total parameter count varies by tokenizer: 1.27B for 128K vocab, slightly more for Apertus (131K). The training token budget uses `scaling_params = transformer_matrices + lm_head` (excluding wte and VE) to avoid the token budget scaling with vocabulary size.
+
+### Weight decay bug in pilot runs
+
+The 300M pilot runs used an incorrect weight decay scaling formula: `D_REF` was set to the current model's token budget instead of the d12 reference budget. This produced WD = 0.396 instead of the correct 0.131 — a 3× overestimate. Since all 16 pilot tokenizers experienced the same bug, **relative comparisons are valid**, but absolute performance was suboptimal. The bug was fixed before 1.27B training.
+
+### Checkpoint pruning race condition
+
+An early version of the checkpoint pruning code (keeping only the last N checkpoints) deleted files on rank 0 while other ranks were still writing optimizer state, causing crashes at steps 2000–4000 in the first 1B training submission. Fixed by setting `max_checkpoints=0` (no pruning) and adding barrier-guarded rank-0-only deletion logic. All 1B training completed successfully after this fix.
+
+### Single-node training only
+
+nanochat's `DistMuonAdamW` optimizer performs custom NCCL collective operations (reduce_scatter, all_gather) designed for single-node multi-GPU communication. Multi-node training hangs during `torch.compile` due to NCCL collective ordering mismatches across nodes. All models were trained on a single node (4× GH200 120GB GPUs) with gradient accumulation of 8 micro-batches to maintain the 2²⁰-token batch size.

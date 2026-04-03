@@ -124,12 +124,13 @@ def mix_datasets(sources: list, output_dir: str, total_docs: int = None,
     total_w = sum(w for _, w, _ in source_iterators)
     source_iterators = [(it, w / total_w, p) for it, w, p in source_iterators]
 
-    # Interleave documents
+    # Interleave documents, tracking per-source text byte counts
     doc_buffer = []
     file_idx = 0
     total = 0
     total_bytes = 0
     docs_per_file = 50000
+    per_source_stats = {}  # path -> {"docs": int, "text_bytes": int}
 
     while source_iterators:
         if total_docs and total >= total_docs:
@@ -159,7 +160,15 @@ def mix_datasets(sources: list, output_dir: str, total_docs: int = None,
 
         doc_buffer.append(text)
         total += 1
-        total_bytes += len(text.encode("utf-8"))
+        text_byte_len = len(text.encode("utf-8"))
+        total_bytes += text_byte_len
+
+        # Track per-source stats
+        src_path = source_iterators[chosen_idx][2]
+        if src_path not in per_source_stats:
+            per_source_stats[src_path] = {"docs": 0, "text_bytes": 0}
+        per_source_stats[src_path]["docs"] += 1
+        per_source_stats[src_path]["text_bytes"] += text_byte_len
 
         if len(doc_buffer) >= docs_per_file:
             filepath = os.path.join(output_dir, f"shard_{file_idx:05d}.parquet")
@@ -190,10 +199,23 @@ def mix_datasets(sources: list, output_dir: str, total_docs: int = None,
             table = pa.table({"text": doc_buffer})
             pq.write_table(table, filepath, row_group_size=100)
 
+    # Build per-source breakdown for metadata
+    source_breakdown = []
+    for sc in source_configs:
+        stats = per_source_stats.get(sc["path"], {"docs": 0, "text_bytes": 0})
+        source_breakdown.append({
+            "path": sc["path"],
+            "input_weight": sc["weight"],
+            "text_field": sc["text_field"],
+            "docs": stats["docs"],
+            "text_bytes": stats["text_bytes"],
+            "actual_byte_fraction": stats["text_bytes"] / total_bytes if total_bytes > 0 else 0,
+        })
+
     metadata = {
-        "sources": [{k: v for k, v in sc.items()} for sc in source_configs],
+        "sources": source_breakdown,
         "total_docs": total,
-        "total_bytes": total_bytes,
+        "total_text_bytes": total_bytes,
         "num_files": file_idx + 1,
         "val_docs": min(val_docs, len(doc_buffer) if len(doc_buffer) <= val_docs else val_docs),
         "seed": seed,
@@ -201,8 +223,17 @@ def mix_datasets(sources: list, output_dir: str, total_docs: int = None,
     with open(os.path.join(output_dir, "metadata.json"), "w") as f:
         json.dump(metadata, f, indent=2)
 
-    print(f"\nDone: {total:,} docs, {total_bytes/1e9:.2f} GB, {file_idx+1} files")
+    print(f"\nDone: {total:,} docs, {total_bytes/1e9:.2f} GB text, {file_idx+1} files")
     print(f"Output: {output_dir}")
+
+    # Print per-source breakdown
+    print(f"\nPer-source breakdown (text bytes, not parquet bytes):")
+    print(f"  {'Source':<60} {'Docs':>10} {'Text GB':>10} {'Weight':>8} {'Actual':>8}")
+    print(f"  {'-'*60} {'-'*10} {'-'*10} {'-'*8} {'-'*8}")
+    for sb in sorted(source_breakdown, key=lambda x: -x["text_bytes"]):
+        name = os.path.basename(sb["path"].rstrip("/"))
+        print(f"  {name:<60} {sb['docs']:>10,} {sb['text_bytes']/1e9:>10.3f} "
+              f"{sb['input_weight']:>7.1%} {sb['actual_byte_fraction']:>7.1%}")
 
 
 def download_dataset(

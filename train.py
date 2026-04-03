@@ -47,6 +47,23 @@ import nanochat.dataset
 from tokenizer_lm.tokenizer import load_tokenizer, generate_token_bytes
 
 
+def _prune_checkpoints(checkpoint_dir, max_keep, rank):
+    """Remove old checkpoints, keeping only the most recent max_keep."""
+    import glob
+    model_files = sorted(glob.glob(os.path.join(checkpoint_dir, "model_*.pt")))
+    if len(model_files) <= max_keep:
+        return
+    to_remove = model_files[:-max_keep]
+    for model_path in to_remove:
+        step_str = os.path.basename(model_path).split("_")[1].split(".")[0]
+        # Remove model, meta, and optimizer files for this step
+        for pattern in [f"model_{step_str}.pt", f"meta_{step_str}.json", f"optim_{step_str}_rank*.pt"]:
+            for f in glob.glob(os.path.join(checkpoint_dir, pattern)):
+                os.remove(f)
+        if rank == 0:
+            print0(f"Pruned checkpoint step {int(step_str)}")
+
+
 def load_config(config_path: str) -> dict:
     with open(config_path) as f:
         return yaml.safe_load(f)
@@ -63,6 +80,9 @@ def main():
                         help="W&B run name (default: auto from config)")
     parser.add_argument("--resume-from-step", type=int, default=-1,
                         help="Resume training from this step (-1 = disabled)")
+    parser.add_argument("--init-from", type=str, default=None,
+                        help="Initialize model weights from checkpoint dir:step (e.g., /path/to/ckpt:8800). "
+                             "Loads only model weights; optimizer, step counter, and LR schedule start fresh.")
     parser.add_argument("--seed", type=int, default=None,
                         help="Random seed (default: from config, or 42)")
     args = parser.parse_args()
@@ -145,7 +165,7 @@ def main():
 
     # --- Checkpoint resume ---
     output_dir = os.path.expandvars(cfg.get("output_dir", "out"))
-    run_tag = cfg.get("name", "run")
+    run_tag = args.run_name or cfg.get("name", "run")
     checkpoint_dir = os.path.join(output_dir, run_tag)
     resuming = args.resume_from_step != -1
 
@@ -157,6 +177,20 @@ def main():
         )
         model.load_state_dict(model_data, strict=True, assign=True)
         del model_data
+    elif args.init_from:
+        # Load model weights only (no optimizer, no step counter)
+        init_parts = args.init_from.rsplit(":", 1)
+        if len(init_parts) != 2:
+            raise ValueError(f"--init-from must be 'checkpoint_dir:step', got '{args.init_from}'")
+        init_dir, init_step = init_parts[0], int(init_parts[1])
+        print0(f"Initializing model weights from {init_dir} step {init_step}")
+        model_data, _, _ = load_checkpoint(
+            init_dir, init_step, device, load_optimizer=False,
+        )
+        model_data = {k.removeprefix("_orig_mod."): v for k, v in model_data.items()}
+        model.load_state_dict(model_data, strict=True, assign=True)
+        del model_data
+        print0(f"Model weights loaded (optimizer and schedule start fresh)")
 
     # --- Compile ---
     orig_model = model
@@ -184,15 +218,15 @@ def main():
 
     target_tokens = int(target_ratio * num_scaling_params) if target_ratio > 0 else int(train_cfg.get("max_tokens", 5e9))
 
+    # d12 reference model (nanochat default: 768 dim, 32K vocab, aspect_ratio=64)
+    # Used for batch size auto-computation and weight decay scaling
+    B_REF = 2**19  # 524288 tokens (d12 optimal batch size)
+    d12_scaling_params = 12 * (768**2) * 12 + 768 * 32768
+    D_REF = target_ratio * d12_scaling_params if target_ratio > 0 else d12_scaling_params * 10.5
+
     total_batch_size = train_cfg.get("total_batch_size", -1)
     if total_batch_size == -1:
         # Auto-compute via Power Lines scaling (B_opt ∝ D^0.383)
-        # Reference: d12 model with aspect_ratio=64 → 768 dim
-        # nanochat tunes B_REF=524288 at d12's compute-optimal token budget
-        B_REF = 2**19  # 524288 tokens
-        # D_REF is the d12 reference model's token budget, NOT our model's
-        d12_scaling_params = 12 * (768**2) * 12 + 768 * 32768  # d12 reference with nanochat's default 32K vocab
-        D_REF = target_ratio * d12_scaling_params if target_ratio > 0 else d12_scaling_params * 10.5
         batch_ratio = target_tokens / D_REF
         predicted = B_REF * batch_ratio ** 0.383
         total_batch_size = 2 ** round(math.log2(predicted))
@@ -219,18 +253,24 @@ def main():
     if batch_lr_scale != 1.0:
         print0(f"Batch LR scale: {batch_lr_scale:.4f}")
 
-    # Weight decay scaling (T_epoch framework)
+    # Weight decay scaling (T_epoch framework, https://arxiv.org/abs/2405.13698)
+    # λ = λ_ref · √(B/B_ref) · (D_ref/D) where D_ref is d12 reference token budget
     base_wd = optim_cfg.get("weight_decay", 0.28)
-    D_REF_wd = target_ratio * num_scaling_params if target_ratio > 0 else total_tokens
-    weight_decay_scaled = base_wd * math.sqrt(total_batch_size / (2**19)) * (D_REF_wd / total_tokens)
+    weight_decay_scaled = base_wd * math.sqrt(total_batch_size / B_REF) * (D_REF / target_tokens)
+    print0(f"Weight decay: {base_wd:.4f} → {weight_decay_scaled:.6f} (D_REF={int(D_REF):,}, D={target_tokens:,})")
 
     # --- Optimizer ---
+    # width_lr_exponent: -0.5 = nanochat default (∝1/√width), -1.0 = µP (∝1/width)
+    # µP makes hyperparameters transfer across model widths by construction,
+    # reducing sensitivity to model size and making the comparison more robust.
+    width_lr_exponent = optim_cfg.get("width_lr_exponent", -1.0)
     optimizer = model.setup_optimizer(
         unembedding_lr=optim_cfg.get("unembedding_lr", 0.008) * batch_lr_scale,
         embedding_lr=optim_cfg.get("embedding_lr", 0.3) * batch_lr_scale,
         scalar_lr=optim_cfg.get("scalar_lr", 0.5) * batch_lr_scale,
         matrix_lr=optim_cfg.get("matrix_lr", 0.02) * batch_lr_scale,
         weight_decay=weight_decay_scaled,
+        width_lr_exponent=width_lr_exponent,
     )
 
     if resuming:
@@ -342,6 +382,15 @@ def main():
                 },
                 rank=ddp_rank,
             )
+            # Prune old checkpoints, keeping only the most recent max_keep.
+            # Only rank 0 prunes (other ranks' optimizer files are cleaned by glob).
+            # Barrier ensures all ranks have finished writing before any deletion.
+            max_keep = log_cfg.get("max_checkpoints", 0)
+            if max_keep > 0 and not last_step:
+                synchronize()
+                if ddp_rank == 0:
+                    _prune_checkpoints(checkpoint_dir, max_keep, ddp_rank)
+                synchronize()
 
         if last_step:
             break
@@ -423,6 +472,96 @@ def main():
     if val_bpb is not None:
         print0(f"Min val bpb: {min_val_bpb:.6f}")
     print0(f"Total bytes consumed: {total_bytes_consumed/1e9:.2f}B")
+
+    # --- FLORES-200 evaluation (rank 0 only) ---
+    if master_process and train_cfg.get("flores_eval", True):
+        print0(f"\n{'='*60}")
+        print0("Running FLORES-200 BPB evaluation...")
+        print0(f"{'='*60}\n")
+        try:
+            from eval_runner import compute_flores_perplexity, LANGUAGE_FAMILIES
+            orig_model.eval()
+            flores_results = compute_flores_perplexity(
+                orig_model, tokenizer, device=device, max_samples=200,
+            )
+
+            # Per-language BPB
+            lang_bpbs = {lang: data["bpb"]
+                         for lang, data in flores_results.get("per_language", {}).items()}
+
+            if lang_bpbs:
+                bpb_values = list(lang_bpbs.values())
+                mean_bpb = sum(bpb_values) / len(bpb_values)
+                variance = sum((b - mean_bpb) ** 2 for b in bpb_values) / len(bpb_values)
+                std_bpb = variance ** 0.5
+                min_bpb = min(bpb_values)
+                max_bpb = max(bpb_values)
+
+                print0(f"\nFLORES-200 BPB summary ({len(lang_bpbs)} languages):")
+                print0(f"  Mean:     {mean_bpb:.4f}")
+                print0(f"  Std:      {std_bpb:.4f}")
+                print0(f"  Min:      {min_bpb:.4f}")
+                print0(f"  Max:      {max_bpb:.4f}")
+                print0(f"  Range:    {max_bpb - min_bpb:.4f}")
+                print0(f"  CV:       {std_bpb / mean_bpb:.4f}")
+
+                # Per-family summary
+                print0(f"\nPer-family BPB:")
+                for family, fdata in sorted(
+                    flores_results.get("per_family", {}).items(),
+                    key=lambda x: x[1]["mean_bpb"],
+                ):
+                    print0(f"  {family:<20} {fdata['mean_bpb']:.4f} "
+                           f"({fdata['num_languages']} langs)")
+
+                # Top 10 best and worst languages
+                sorted_langs = sorted(lang_bpbs.items(), key=lambda x: x[1])
+                print0(f"\nBest 10 languages:")
+                for lang, bpb in sorted_langs[:10]:
+                    print0(f"  {lang:<12} {bpb:.4f}")
+                print0(f"\nWorst 10 languages:")
+                for lang, bpb in sorted_langs[-10:]:
+                    print0(f"  {lang:<12} {bpb:.4f}")
+
+                # Log to W&B
+                wandb_log = {
+                    "flores/mean_bpb": mean_bpb,
+                    "flores/std_bpb": std_bpb,
+                    "flores/min_bpb": min_bpb,
+                    "flores/max_bpb": max_bpb,
+                    "flores/cv_bpb": std_bpb / mean_bpb,
+                    "flores/num_languages": len(lang_bpbs),
+                }
+                # Log per-family
+                for family, fdata in flores_results.get("per_family", {}).items():
+                    safe_family = family.replace("-", "_").replace(" ", "_")
+                    wandb_log[f"flores/family/{safe_family}"] = fdata["mean_bpb"]
+                # Log per-language (top-level languages only to avoid clutter)
+                for lang, bpb in lang_bpbs.items():
+                    wandb_log[f"flores/lang/{lang}"] = bpb
+                wandb_run.log(wandb_log)
+
+                # Save results to checkpoint dir
+                flores_path = os.path.join(checkpoint_dir, "flores_results.json")
+                import json as json_mod
+                with open(flores_path, "w") as f:
+                    json_mod.dump({
+                        "summary": {
+                            "mean_bpb": mean_bpb,
+                            "std_bpb": std_bpb,
+                            "min_bpb": min_bpb,
+                            "max_bpb": max_bpb,
+                            "cv_bpb": std_bpb / mean_bpb,
+                            "num_languages": len(lang_bpbs),
+                        },
+                        "per_language": lang_bpbs,
+                        "per_family": flores_results.get("per_family", {}),
+                    }, f, indent=2)
+                print0(f"\nFLORES results saved to {flores_path}")
+        except Exception as e:
+            print0(f"WARNING: FLORES evaluation failed: {e}")
+            import traceback
+            traceback.print_exc()
 
     wandb_run.finish()
     compute_cleanup()
